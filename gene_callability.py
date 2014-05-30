@@ -1,5 +1,9 @@
 import argparse
 import sausage
+from pprint import pprint
+import re
+from pybedtools import BedTool
+import pandas as pd
 
 
 def display_gene_callability(
@@ -26,14 +30,116 @@ def display_gene_callability(
         Nothing! Just print a pretty summary
 
     """
+    print '--------------------------------------'
+    print 'Report for Sample:', args.sample_id
+    print 'Gene Name: %s (%s)' % (gene['ID'], gene['external_name'])
+    print '--------------------------------------'
+    print ''
 
-    # worst possible implementation
-    print(gene)
-    print(qmi_results)
-    print(dt_results)
+    missing_intervals_and_overlapping_features = get_features_with_missing_intervals(gene['cds'], qmi_results)
 
-    return
+    not_baited_count = 0
+    unknown_count = 0
+    gc_content_count = 0
 
+    unknown_bases_count = 0
+    gc_content_bases_count = 0
+    not_baited_count = 0
+
+    total_gene = pd.DataFrame.from_records(gene['cds'])
+    total_gene = total_gene.drop_duplicates()
+
+    total_cds_bases = (total_gene['end'] - total_gene['start']).sum()
+
+    missing_intervals = []
+    for x in missing_intervals_and_overlapping_features:
+        missing_intervals += x[1]
+
+    df = pd.DataFrame.from_records(missing_intervals)
+    df = df.drop_duplicates()
+    total_bases = (df['MISSING_SIZE'].astype(int)).sum()
+
+    not_baited = df[df['BAITED'] == 'false']
+    not_baited_count = not_baited['MISSING_SIZE'].astype(int).sum()
+
+    high_gc_content = df[(df['INTERPRETATION'] == 'GCCONTENT') & (df['BAITED'] == 'true')]
+    high_gc_content_count = high_gc_content['MISSING_SIZE'].astype(int).sum()
+
+    unknown = df[(df['INTERPRETATION'] == 'UNKNOWN') & (df['BAITED'] == 'true')]
+    unknown_count = unknown['MISSING_SIZE'].astype(int).sum()
+
+    print '%d bases within CDS features in %s were found to be missing' % (total_bases, gene['external_name'])
+    print '---> Not baited: %d' % (not_baited_count)
+
+    for interval in not_baited['INTERVAL'].tolist():
+        print '    ---> %s' % (interval)
+    print '---> High GC content: %d' % (high_gc_content_count)
+    print '---> Unknown cause: %d' % (unknown_count)
+
+
+def get_features_with_missing_intervals(features, qmi_results):
+    """
+    Return a list of tuples, each of which contains a feature (each in dictionary format) and a list of missing intervals
+    (each in dictionary format) that overlap said feature.
+    """
+    interval_list = _get_missing_interval_list(qmi_results)
+    qmi_bed_tool = BedTool(interval_list)
+
+    results = []
+    for feature in features:
+
+        feature_bed_tool = BedTool([(u'chr' + feature['seq_region_name'], int(feature['start']), int(feature['end']))])
+        overlapping_missing_intervals = list(qmi_bed_tool.intersect(feature_bed_tool))
+
+        if len(overlapping_missing_intervals) > 0:
+            missing_interval_list = []
+            for x in overlapping_missing_intervals:
+                # Get the relevant feature dict
+                missing_interval = qmi_results[int(x[3])]
+
+                # Adjust the missing interval to only the missing portion
+                missing_interval['INTERVAL'] = '%s:%s-%s' % (x[0], x[1], x[2])
+                missing_interval['MISSING_SIZE'] = int(x[2]) - int(x[1])
+                missing_interval_list.append(missing_interval)
+
+            results.append((feature, missing_interval_list))
+
+    return results
+
+
+def _get_missing_interval_list(qmi_results):
+    """
+    Return a list the missing intervals in bed format (chromosome, start, end, index in list of features)
+    Index in list used pull full interval definition back out after overlap calculation.
+    """
+    interval_list = []
+    for i, interval in enumerate(qmi_results):
+        qmi_chromosome, qmi_start, qmi_end = _parse_interval(interval['INTERVAL'])
+        interval_list.append(('chr' + qmi_chromosome, qmi_start, qmi_end, i))
+
+    return interval_list
+
+
+def _parse_interval(interval):
+    """
+    Return chromsome name, start coordinate, and end coordinate of a missing interval from qmi_results
+    interval notation (chromosome:start-end)
+    """
+
+    match = re.search(r'([\dA-Za-z]+):(\d+)-?(\d+)?', interval)
+
+    if not match:
+        raise ValueError('Unexpected genomic interval format: ' + str(interval))
+
+    chromosome_name = match.group(1)
+    start_coordinate = match.group(2)
+    end_coordinate = match.group(3)
+
+    # One-base intervals will not have an end coordinate
+    if not end_coordinate:
+        end_coordinate = start_coordinate
+
+    return chromosome_name, int(start_coordinate), int(end_coordinate)
 
 
 def run(gene_id, sample_id):
